@@ -148,8 +148,24 @@ pixi run test
 Or with a specific connection:
 
 ```bash
-SNOWFLAKE_CONNECTION_NAME=my_connection pixi run test
+SNOWFLAKE_CONNECTION_NAME=my_connection \
+  MCP_DATABASE=MY_DB \
+  MCP_SCHEMA=MY_SCHEMA \
+  MCP_SERVER_NAME=MY_MCP_SERVER \
+  MCP_TOKEN_ROLE=MY_ROLE \
+  SNOWFLAKE_ACCOUNT_URL=https://<account>.snowflakecomputing.com \
+  pixi run test
 ```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SNOWFLAKE_CONNECTION_NAME` | `default` | Connection name from `~/.snowflake/connections.toml` |
+| `SNOWFLAKE_ACCOUNT_URL` | — | Full account URL (e.g. `https://myorg-myaccount.snowflakecomputing.com`) |
+| `MCP_DATABASE` | `MY_DB` | Database containing the MCP server |
+| `MCP_SCHEMA` | `MY_SCHEMA` | Schema containing the MCP server |
+| `MCP_SERVER_NAME` | `MY_MCP_SERVER` | Name of the managed MCP server |
+| `MCP_TOKEN_UDF` | `<db>.<schema>.generate_token_test` | Fully qualified UDF that returns an OAuth token |
+| `MCP_TOKEN_ROLE` | `MY_ROLE` | Role used for the RBAC revoke/re-grant test |
 
 ### Expected Output
 
@@ -191,7 +207,22 @@ TEST 2: tools/call — execute SQL via external OAuth
 }
 
 ============================================================
-RESULT: External OAuth tokens WORK with managed MCP servers
+TEST 3: RBAC enforcement — revoke grant, expect denial
+============================================================
+Revoked USAGE on MY_DB.MY_SCHEMA.MY_MCP_SERVER from MY_ROLE
+{
+  "http_status": 200,
+  "jsonrpc": "2.0",
+  "id": 3,
+  "error": {
+    "code": -32603,
+    "message": "MCP server ... does not exist or not authorized."
+  }
+}
+Re-granted USAGE on MY_DB.MY_SCHEMA.MY_MCP_SERVER to MY_ROLE
+
+============================================================
+RESULT: All tests PASSED — OAuth works, RBAC enforced
 ============================================================
 ```
 
