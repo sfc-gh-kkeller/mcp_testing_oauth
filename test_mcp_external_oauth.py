@@ -57,14 +57,36 @@ def main():
     })
     print(json.dumps(result2, indent=2))
 
+    print()
+    print("=" * 60)
+    print("TEST 3: RBAC enforcement — revoke grant, expect denial")
+    print("=" * 60)
+    mcp_fqn = f"{db}.{schema}.{mcp_server_name}"
+    role = os.getenv("MCP_TOKEN_ROLE", "DOCKERTEST")
+    cur.execute(f"REVOKE USAGE ON MCP SERVER {mcp_fqn} FROM ROLE {role}")
+    print(f"Revoked USAGE on {mcp_fqn} from {role}")
+
+    result3 = mcp_request(mcp_endpoint, headers, {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/list",
+    })
+    print(json.dumps(result3, indent=2))
+
+    cur.execute(f"GRANT USAGE ON MCP SERVER {mcp_fqn} TO ROLE {role}")
+    print(f"Re-granted USAGE on {mcp_fqn} to {role}")
+
     conn.close()
 
     print()
     print("=" * 60)
     success1 = isinstance(result1, dict) and "http_error" not in result1 and "error" not in result1
     success2 = isinstance(result2, dict) and "http_error" not in result2 and "error" not in result2
-    if success1 and success2:
-        print("RESULT: External OAuth tokens WORK with managed MCP servers")
+    rbac_denied = isinstance(result3, dict) and "error" in result3
+    if success1 and success2 and rbac_denied:
+        print("RESULT: All tests PASSED — OAuth works, RBAC enforced")
+    elif success1 and success2:
+        print("RESULT: OAuth works but RBAC denial was NOT enforced (unexpected)")
     elif success1:
         print("RESULT: tools/list works but tools/call failed with external OAuth")
     else:
