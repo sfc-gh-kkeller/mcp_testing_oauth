@@ -1,5 +1,5 @@
 [project]
-authors = [{name = "sfc-gh-kkeller", email = "kevin.keller@snowflake.com"}]
+authors = []
 dependencies = []
 name = "mcp_testing_oauth"
 requires-python = ">= 3.11"

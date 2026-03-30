@@ -62,7 +62,7 @@ def main():
     print("TEST 3: RBAC enforcement — revoke grant, expect denial")
     print("=" * 60)
     mcp_fqn = f"{db}.{schema}.{mcp_server_name}"
-    role = os.getenv("MCP_TOKEN_ROLE", "DOCKERTEST")
+    role = os.getenv("MCP_TOKEN_ROLE", "MY_ROLE")
     cur.execute(f"REVOKE USAGE ON MCP SERVER {mcp_fqn} FROM ROLE {role}")
     print(f"Revoked USAGE on {mcp_fqn} from {role}")
 
