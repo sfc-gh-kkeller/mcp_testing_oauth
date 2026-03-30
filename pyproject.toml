@@ -1,0 +1,23 @@
+[project]
+authors = [{name = "sfc-gh-kkeller", email = "kevin.keller@snowflake.com"}]
+dependencies = []
+name = "mcp_testing_oauth"
+requires-python = ">= 3.11"
+version = "0.1.0"
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[tool.pixi.pypi-dependencies]
+mcp_testing_oauth = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+test = "python test_mcp_external_oauth.py"
+
+[tool.pixi.dependencies]
+snowflake-connector-python = ">=4.4.0,<5"
