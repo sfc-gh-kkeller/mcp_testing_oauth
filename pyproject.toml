@@ -15,9 +15,15 @@ platforms = ["osx-arm64"]
 
 [tool.pixi.pypi-dependencies]
 mcp_testing_oauth = { path = ".", editable = true }
+pyjwt = ">=2.8.0"
+cryptography = ">=41.0.0"
 
 [tool.pixi.tasks]
-test = "python test_mcp_external_oauth.py"
+test = "python test_01_external_oauth_basic.py"
+isolation = "python test_02_external_oauth_role_control.py"
+pat = "python test_03_pat_role_isolation.py"
+demo = "python test_04_interactive_demo.py"
+agent-test = "python test_04_interactive_demo.py --agent-test"
 
 [tool.pixi.dependencies]
 snowflake-connector-python = ">=4.4.0,<5"

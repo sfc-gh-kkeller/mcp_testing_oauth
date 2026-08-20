@@ -1,265 +1,176 @@
-# External OAuth Tokens with Snowflake Managed MCP Servers
+# MCP Server Role Control with External OAuth and PATs
 
-## TL;DR
+## Summary of Findings
 
-**External OAuth tokens work with Snowflake managed MCP servers.** Authentication passes through, RBAC is enforced via the role encoded in the token's `scp` claim, and both `tools/list` and `tools/call` succeed.
+This repository documents tested approaches for controlling which Snowflake role is used when connecting to a managed MCP server via External OAuth or Programmatic Access Tokens (PATs). All findings are validated against a real Snowflake account with reproducible test scripts.
 
-## What Was Tested
+**Key discovery:** The `X-Snowflake-Role` HTTP header + scoped External OAuth tokens provides full per-request role control and domain isolation on the MCP path — without touching `DEFAULT_ROLE`.
 
-| Test | Method | Result |
-|------|--------|--------|
-| Tool discovery | `tools/list` via JSON-RPC POST | 200 OK - returned tool schema |
-| Tool invocation | `tools/call` (SYSTEM_EXECUTE_SQL) | 200 OK - executed SQL, returned results |
-| Auth rejection | Token role without USAGE grant | JSON-RPC error: "does not exist or not authorized" |
-| Auth acceptance | Token role with proper RBAC grants | Full success |
+## Role Control Methods (Tested & Validated)
 
-## Architecture
+| # | Method | Role override? | Secondary roles | Domain isolation? | Per-request? |
+|---|--------|---------------|-----------------|-------------------|--------------|
+| 1 | `session:role-any` (no header) | No (uses DEFAULT_ROLE) | ALL active | No | No |
+| 2 | `session:role-any` + `X-Snowflake-Role: X` | Yes | ALL active | No | Yes |
+| 3 | `session:role:X` + `X-Snowflake-Role: X` | Yes | **NONE** | **Yes** | Yes |
+| 4 | PAT with `ROLE_RESTRICTION=X` | Yes | **NONE** | **Yes** | Per-token |
+| 5 | `session:role-any` + Session Policy `ALLOWED_SECONDARY_ROLES=(A,B)` | No (DEFAULT_ROLE) | **Only A,B** | **Yes (curated)** | No |
+| 6 | Token scp array `[role:A, role:B]` + `X-Snowflake-Role` per request | Yes (switches between A,B) | NONE per request | Yes (per-request) | Yes |
 
-```
-                    ┌────────────────────────────┐
-                    │   External OAuth Token      │
-                    │   (JWT signed with RSA key) │
-                    │                            │
-                    │   iss: <your_issuer>       │
-                    │   aud: <your_audience>     │
-                    │   scp: session:role:<ROLE> │
-                    │   name: <SF_LOGIN_NAME>    │
-                    └────────────┬───────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────┐
-│  Snowflake External OAuth Security Integration          │
-│  (YOUR_INTEGRATION)                                     │
-│                                                         │
-│  - Validates JWT signature against RSA public key       │
-│  - Maps token claims to Snowflake user + role           │
-│  - EXTERNAL_OAUTH_ANY_ROLE_MODE = ENABLE                │
-└────────────────────────┬────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│  Managed MCP Server                                     │
-│  (DB.SCHEMA.YOUR_MCP_SERVER)                            │
-│                                                         │
-│  Endpoint: POST /api/v2/databases/{db}/schemas/{schema} │
-│            /mcp-servers/{name}                          │
-│                                                         │
-│  Tool: sql-exec-tool (SYSTEM_EXECUTE_SQL)               │
-│  RBAC: Role from token must have USAGE on MCP server    │
-└─────────────────────────────────────────────────────────┘
-```
+## Detailed Findings
 
-## How to Reproduce (Quick and Dirty)
+### 1. `X-Snowflake-Role` Header Works on MCP Endpoints
 
-### Prerequisites
+The [REST API context headers](https://docs.snowflake.com/en/developer-guide/snowflake-rest-api/setting-context) (`X-Snowflake-Role`, `X-Snowflake-Warehouse`) work on the MCP server endpoint. When provided, `X-Snowflake-Role` **takes precedence over DEFAULT_ROLE**.
 
-- A Snowflake account with External OAuth configured
-- `pixi` installed ([pixi.sh](https://pixi.sh))
-- A Snowflake connection configured in `~/.snowflake/connections.toml`
+This means:
+- No need to `ALTER USER SET DEFAULT_ROLE` per session
+- The role is controlled per HTTP request
+- Combined with a scoped token, provides full isolation
 
-### Step 1: Create the External OAuth Security Integration
+### 2. Token Scope Controls Secondary Roles
 
-This integration tells Snowflake how to validate your custom JWT tokens. You need an RSA key pair — the private key signs tokens, the public key goes into the integration.
+| Token scope | Secondary roles behavior |
+|-------------|------------------------|
+| `session:role-any` | Secondary roles **active** (all granted roles) |
+| `session:role:X` | Secondary roles **disabled** (only X's grants) |
+
+This is the key to isolation: a token scoped to `session:role:DEMO_DOMAIN_FINANCE` with `X-Snowflake-Role: DEMO_DOMAIN_FINANCE` gives a session with ONLY finance privileges — no secondary roles leak access to other domains.
+
+### 3. PAT with ROLE_RESTRICTION
+
+Programmatic Access Tokens with `ROLE_RESTRICTION` override DEFAULT_ROLE completely and disable secondary roles. This works identically to approach #3 above but without needing an External OAuth integration.
 
 ```sql
-CREATE OR REPLACE SECURITY INTEGRATION my_ext_oauth
-    TYPE = EXTERNAL_OAUTH
-    ENABLED = TRUE
-    EXTERNAL_OAUTH_TYPE = CUSTOM
-    EXTERNAL_OAUTH_ISSUER = '<your_issuer_url>'
-    EXTERNAL_OAUTH_RSA_PUBLIC_KEY = '<your_rsa_public_key>'
-    EXTERNAL_OAUTH_TOKEN_USER_MAPPING_CLAIM = 'name'
-    EXTERNAL_OAUTH_SNOWFLAKE_USER_MAPPING_ATTRIBUTE = 'login_name'
-    EXTERNAL_OAUTH_SCOPE_MAPPING_ATTRIBUTE = 'scp'
-    EXTERNAL_OAUTH_ANY_ROLE_MODE = 'ENABLE'
-    EXTERNAL_OAUTH_AUDIENCE_LIST = ('<your_audience_url>');
+ALTER USER <service_user> ADD PROGRAMMATIC ACCESS TOKEN <name>
+  ROLE_RESTRICTION = 'DEMO_DOMAIN_FINANCE'
+  DAYS_TO_EXPIRY = 30;
 ```
 
-### Step 2: Create a UDF to Generate Tokens
+Use with header: `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`
 
-This UDF mints JWTs signed with the matching RSA private key. The token encodes the Snowflake username and desired role.
+### 4. Session Policy for Curated Multi-Domain Access
+
+For users who need combined access from exactly N domains (but not all):
 
 ```sql
-CREATE OR REPLACE FUNCTION generate_token_test()
-RETURNS VARCHAR
-LANGUAGE PYTHON
-RUNTIME_VERSION = '3.11'
-PACKAGES = ('pyjwt','cryptography')
-HANDLER = 'udf'
-AS $$
-import jwt
-from datetime import datetime, timedelta
-
-def udf():
-    # Load your RSA private key (matching the public key in the integration)
-    private_key = b"""-----BEGIN RSA PRIVATE KEY-----
-    <your_rsa_private_key>
-    -----END RSA PRIVATE KEY-----"""
-
-    now = datetime.utcnow()
-    now_plus_100 = now + timedelta(minutes=100)
-
-    encoded = jwt.encode({
-        "iss": "<your_issuer_url>",
-        "aud": "<your_audience_url>",
-        "scp": "session:role:<YOUR_ROLE>",
-        "name": "<YOUR_SNOWFLAKE_LOGIN_NAME>",
-        "iat": now,
-        "exp": now_plus_100
-    }, private_key, algorithm="RS256")
-
-    return encoded
-$$;
+CREATE SESSION POLICY my_policy
+  ALLOWED_SECONDARY_ROLES = ('DOMAIN_FINANCE', 'DOMAIN_MARKETING');
+ALTER USER <user> SET SESSION POLICY my_policy;
 ```
 
-> **To adapt for your own account:** Generate your own RSA key pair. Set the `name` claim to your Snowflake login name, `scp` to `session:role:<YOUR_ROLE>`, and use your own issuer/audience URLs matching the security integration.
+With `session:role-any`, the session gets ONLY finance + marketing as secondary roles. Engineering (and all other roles) are blocked even though the token theoretically permits them.
 
-### Step 3: Create the Managed MCP Server
+### 5. Token Scope Array = Per-Request Role Switching Allowlist
 
-```sql
-CREATE OR REPLACE MCP SERVER <db>.<schema>.my_mcp_server
-  FROM SPECIFICATION $$
-    tools:
-      - title: "SQL Execution Tool"
-        name: "sql-exec-tool"
-        type: "SYSTEM_EXECUTE_SQL"
-        description: "A tool to execute SQL queries against the connected Snowflake database."
-  $$;
+The `scp` claim can be a JSON array of roles:
+```json
+{"scp": ["session:role:DOMAIN_FINANCE", "session:role:DOMAIN_MARKETING"]}
 ```
 
-### Step 4: Grant RBAC Permissions
+This allows the bearer to switch between FINANCE and MARKETING via `X-Snowflake-Role` per request, but blocks any other role (e.g., ENGINEERING). Each request still has no secondary roles — it's one role at a time.
 
-The role in the token's `scp` claim needs access to the MCP server and its parent database/schema:
+### 6. OAUTH_AUTHORIZATION_SERVER and OAUTH_SCOPES_SUPPORTED (Jul 2026)
 
-```sql
-GRANT USAGE ON DATABASE <db> TO ROLE <your_role>;
-GRANT USAGE ON SCHEMA <db>.<schema> TO ROLE <your_role>;
-GRANT USAGE ON MCP SERVER <db>.<schema>.my_mcp_server TO ROLE <your_role>;
+These schema-level parameters:
+- **`OAUTH_AUTHORIZATION_SERVER`** — Binds MCP servers to an external IdP. Only tokens from that issuer are accepted.
+- **`OAUTH_SCOPES_SUPPORTED`** — Controls what's advertised in Protected Resource Metadata (RFC 9728).
+
+**Important:** `OAUTH_SCOPES_SUPPORTED` only controls metadata advertisement. It does NOT enable roles beyond DEFAULT_ROLE for External OAuth. You need `X-Snowflake-Role` header for that.
+
+## What Does NOT Work
+
+| Approach | Why it fails |
+|----------|-------------|
+| `USE ROLE` inside MCP session | Blocked (error 399517) — hard-blocked at engine level |
+| SQL chaining with `USE ROLE` | Single-statement enforcement + 399517 |
+| Token `session:role:X` without `X-Snowflake-Role` header | Fails with 390317 if DEFAULT_ROLE != X |
+| `OAUTH_SCOPES_SUPPORTED` overriding DEFAULT_ROLE | It's metadata-only, not enforcement |
+| `DEFAULT_SECONDARY_ROLES = ('ROLE_A', 'ROLE_B')` | Invalid syntax — only accepts `('ALL')` or `()` |
+
+## Architecture Examples
+
+```
+External OAuth Integration:
+  EXTERNAL_OAUTH_ANY_ROLE_MODE = ENABLE
+
+Schema parameters:
+  OAUTH_AUTHORIZATION_SERVER = <integration>
+  OAUTH_SCOPES_SUPPORTED = 'session:role:DOMAIN_A,session:role:DOMAIN_B,session:role-any'
+
+Per MCP client (e.g., Claude Code):
+  Token: session:role:DOMAIN_A
+  Header: X-Snowflake-Role: DOMAIN_A
+  Result: Isolated to DOMAIN_A only (no secondary roles)
+
+For broad access (e.g., internal analytics):
+  Token: session:role-any
+  Header: X-Snowflake-Role: MCP_ACCESS
+  Result: All secondary roles active, full cross-domain access
+
+For curated multi-domain:
+  Session Policy: ALLOWED_SECONDARY_ROLES = ('DOMAIN_A', 'DOMAIN_B')
+  Token: session:role-any
+  Result: Only A + B as secondaries, all others blocked
 ```
 
-### Step 5: Run the Test
+## Claude Code CLI Configuration Example
 
 ```bash
-cd /path/to/mcp_testing_oauth
+# Single domain isolation (finance only)
+claude mcp add snowflake-finance <MCP_URL> \
+  --transport http \
+  --header "Authorization: Bearer <token_scoped_to_finance>" \
+  --header "X-Snowflake-Role: DEMO_DOMAIN_FINANCE" \
+  --header "Accept: application/json" \
+  -s project
+```
+
+With a token whose `scp` = `session:role:DEMO_DOMAIN_FINANCE`, this gives Claude Code access to ONLY finance data.
+
+## Setup & Usage
+
+### With pip (standard Python 3.11+)
+
+```bash
+pip install pyjwt cryptography snowflake-connector-python
+SNOWFLAKE_CONNECTION_NAME=<conn> SNOWFLAKE_ACCOUNT_URL=https://<orgname>-<account>.snowflakecomputing.com python test_02_external_oauth_role_control.py
+```
+
+### With pixi (managed environment)
+
+```bash
 pixi install
-pixi run test
+SNOWFLAKE_CONNECTION_NAME=<conn> SNOWFLAKE_ACCOUNT_URL=https://<orgname>-<account>.snowflakecomputing.com pixi run python test_02_external_oauth_role_control.py
 ```
 
-Or with a specific connection:
+### Environment Variables
 
-```bash
-SNOWFLAKE_CONNECTION_NAME=my_connection \
-  MCP_DATABASE=MY_DB \
-  MCP_SCHEMA=MY_SCHEMA \
-  MCP_SERVER_NAME=MY_MCP_SERVER \
-  MCP_TOKEN_ROLE=MY_ROLE \
-  SNOWFLAKE_ACCOUNT_URL=https://<account>.snowflakecomputing.com \
-  pixi run test
-```
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SNOWFLAKE_CONNECTION_NAME` | Yes | Connection name from `~/.snowflake/connections.toml` |
+| `SNOWFLAKE_ACCOUNT_URL` | Yes | Full account URL (e.g. `https://myorg-myacct.snowflakecomputing.com`) |
+| `SNOWFLAKE_WAREHOUSE` | No | Warehouse to use (default: `S2`) |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SNOWFLAKE_CONNECTION_NAME` | `default` | Connection name from `~/.snowflake/connections.toml` |
-| `SNOWFLAKE_ACCOUNT_URL` | — | Full account URL (e.g. `https://myorg-myaccount.snowflakecomputing.com`) |
-| `MCP_DATABASE` | `MY_DB` | Database containing the MCP server |
-| `MCP_SCHEMA` | `MY_SCHEMA` | Schema containing the MCP server |
-| `MCP_SERVER_NAME` | `MY_MCP_SERVER` | Name of the managed MCP server |
-| `MCP_TOKEN_UDF` | `<db>.<schema>.generate_token_test` | Fully qualified UDF that returns an OAuth token |
-| `MCP_TOKEN_ROLE` | `MY_ROLE` | Role used for the RBAC revoke/re-grant test |
+### Scripts
 
-### Expected Output
+| File | Purpose | Run with |
+|------|---------|----------|
+| `test_01_external_oauth_basic.py` | Does external OAuth work with MCP at all? | `python test_01_external_oauth_basic.py` |
+| `test_02_external_oauth_role_control.py` | External OAuth role patterns: broad, header isolation, session policy, scp array | `python test_02_external_oauth_role_control.py` |
+| `test_03_pat_role_isolation.py` | PAT with ROLE_RESTRICTION (per-token domain isolation) | `python test_03_pat_role_isolation.py` |
+| `test_04_interactive_demo.py` | Interactive demo + `--agent-test` to mint tokens for MCP clients | `python test_04_interactive_demo.py --agent-test` |
 
-```
-============================================================
-TEST 1: tools/list — discover tools via external OAuth
-============================================================
-{
-  "http_status": 200,
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "tools": [
-      {
-        "name": "sql-exec-tool",
-        "description": "A tool to execute SQL queries ...",
-        "inputSchema": { ... }
-      }
-    ]
-  }
-}
+Each script creates all required infrastructure (keys, integration, roles, tables, MCP server) from scratch. Requires ACCOUNTADMIN.
 
-============================================================
-TEST 2: tools/call — execute SQL via external OAuth
-============================================================
-{
-  "http_status": 200,
-  "jsonrpc": "2.0",
-  "id": 2,
-  "result": {
-    "content": [
-      {
-        "type": "text",
-        "text": "{\"result_set\":{\"data\":[[\"<SCHEMA>\",\"<ROLE>\",\"MCP external OAuth test OK\"]]}}"
-      }
-    ],
-    "isError": false
-  }
-}
+## Gotchas
 
-============================================================
-TEST 3: RBAC enforcement — revoke grant, expect denial
-============================================================
-Revoked USAGE on MY_DB.MY_SCHEMA.MY_MCP_SERVER from MY_ROLE
-{
-  "http_status": 200,
-  "jsonrpc": "2.0",
-  "id": 3,
-  "error": {
-    "code": -32603,
-    "message": "MCP server ... does not exist or not authorized."
-  }
-}
-Re-granted USAGE on MY_DB.MY_SCHEMA.MY_MCP_SERVER to MY_ROLE
-
-============================================================
-RESULT: All tests PASSED — OAuth works, RBAC enforced
-============================================================
-```
-
-## Gotchas and Lessons Learned
-
-| Gotcha | Detail |
-|--------|--------|
-| **`Accept` header required** | Must send `Accept: application/json` or you get error code `391902`: "Unsupported Accept header null" |
-| **RBAC is fully enforced** | The role from the token's `scp` claim must have `USAGE` on the MCP server AND `USAGE` on the parent database + schema. Without this you get: "MCP server does not exist or not authorized" (not a 401/403 — it's an HTTP 200 with a JSON-RPC error) |
-| **SQL tool param name** | The `SYSTEM_EXECUTE_SQL` tool expects `sql` as the input parameter, not `statement` |
-| **ANY_ROLE_MODE** | The external OAuth integration needs `EXTERNAL_OAUTH_ANY_ROLE_MODE = 'ENABLE'` for the token to assume the role in the `scp` claim |
-| **Hostname format** | Use hyphens not underscores in account URLs (per Snowflake docs: "MCP servers have connection issues with hostnames containing underscores") |
-| **Auth errors are subtle** | Failed auth doesn't return HTTP 401/403. It returns HTTP 200 with a JSON-RPC `-32603` error. Inspect the response body carefully |
-
-## curl Quick Test
-
-If you just want to test with curl after generating a token:
-
-```bash
-TOKEN=$(snowsql -c my_conn -q "SELECT generate_token_test()" -o output_format=plain -o header=false)
-
-curl -s -X POST \
-  "https://<account>.snowflakecomputing.com/api/v2/databases/<DB>/schemas/<SCHEMA>/mcp-servers/<MCP_SERVER_NAME>" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "tools/list"
-  }'
-```
-
-## Files in This Project
-
-| File | Description |
-|------|-------------|
-| `test_mcp_external_oauth.py` | Python test script — generates token via UDF, hits MCP endpoint, reports results |
-| `pyproject.toml` | Pixi project config with `snowflake-connector-python` dependency |
-| `README.md` | This file |
+| Issue | Detail |
+|-------|--------|
+| `X-Snowflake-Role` required for non-default role | Without the header, MCP always uses DEFAULT_ROLE |
+| Token scope gates the header | `X-Snowflake-Role: X` only works if X is in the token's `scp` (or scp is `session:role-any`) |
+| MCP single-statement only | Cannot chain SQL statements (error: "statement count N did not match desired 1") |
+| Network policy for External OAuth | Your calling IP must be in the account's network policy |
+| `Accept: application/json` required | Without it: error 391902 "Unsupported Accept header null" |
+| `EXTERNAL_OAUTH_ANY_ROLE_MODE = ENABLE` | Required for `session:role-any` to work |
+| Auth errors are HTTP 200 + JSON-RPC error | Not HTTP 401/403 — inspect the response body |
