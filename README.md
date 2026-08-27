@@ -35,7 +35,7 @@ This means:
 | `session:role-any` | Secondary roles **active** (all granted roles) |
 | `session:role:X` | Secondary roles **disabled** (only X's grants) |
 
-This is the key to isolation: a token scoped to `session:role:DEMO_DOMAIN_FINANCE` with `X-Snowflake-Role: DEMO_DOMAIN_FINANCE` gives a session with ONLY finance privileges — no secondary roles leak access to other domains.
+This is the key to isolation: a token scoped to `session:role:DEMO_DOMAIN_FINANCE` with `X-Snowflake-Role: DEMO_DOMAIN_FINANCE` gives a session with ONLY finance privileges — secondary roles are not active, so no other role's grants apply.
 
 ### 3. PAT with ROLE_RESTRICTION
 
@@ -77,6 +77,23 @@ These schema-level parameters:
 - **`OAUTH_SCOPES_SUPPORTED`** — Controls what's advertised in Protected Resource Metadata (RFC 9728).
 
 **Important:** `OAUTH_SCOPES_SUPPORTED` only controls metadata advertisement. It does NOT enable roles beyond DEFAULT_ROLE for External OAuth. You need `X-Snowflake-Role` header for that.
+
+### 7. Ownership and Secondary Roles Interaction
+
+When `session:role-any` is used with `DEFAULT_SECONDARY_ROLES = ('ALL')`, ALL of the user's granted roles become active as secondary roles — including roles that OWN objects. This means a user connecting with role A as primary can access an MCP server owned by role X (with no explicit USAGE grant to A), because role X is active as a secondary role.
+
+This is expected behavior (secondary roles provide combined privileges from all active roles), but worth understanding for access control design.
+
+**To restrict this, use any of these approaches:**
+
+| Method | Effect |
+|--------|--------|
+| Token scope `session:role:X` | Disables all secondary roles for that session |
+| `DEFAULT_SECONDARY_ROLES = ()` on user | Permanently disables secondary roles |
+| Session Policy `ALLOWED_SECONDARY_ROLES = (...)` | Only listed roles activate as secondaries |
+| Session Policy `BLOCKED_SECONDARY_ROLES = ('OWNER_ROLE')` | Specifically blocks that role from being a secondary |
+
+All four are tested and confirmed to prevent access via secondary role inheritance.
 
 ## What Does NOT Work
 
@@ -160,6 +177,8 @@ SNOWFLAKE_CONNECTION_NAME=<conn> SNOWFLAKE_ACCOUNT_URL=https://<orgname>-<accoun
 | `test_02_external_oauth_role_control.py` | External OAuth role patterns: broad, header isolation, session policy, scp array | `python test_02_external_oauth_role_control.py` |
 | `test_03_pat_role_isolation.py` | PAT with ROLE_RESTRICTION (per-token domain isolation) | `python test_03_pat_role_isolation.py` |
 | `test_04_interactive_demo.py` | Interactive demo + `--agent-test` to mint tokens for MCP clients | `python test_04_interactive_demo.py --agent-test` |
+| `test_05_session_policy_secondary_roles.py` | Session Policy ALLOWED/BLOCKED_SECONDARY_ROLES behavior | `python test_05_session_policy_secondary_roles.py` |
+| `test_06_ownership_and_secondary_roles.py` | How MCP ownership interacts with secondary roles | `python test_06_ownership_and_secondary_roles.py` |
 
 Each script creates all required infrastructure (keys, integration, roles, tables, MCP server) from scratch. Requires ACCOUNTADMIN.
 

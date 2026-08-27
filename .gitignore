@@ -7,3 +7,4 @@
 
 # MCP config with bearer tokens
 .mcp.json
+response_mcp_role_concerns.md

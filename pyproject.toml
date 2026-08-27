@@ -24,6 +24,8 @@ isolation = "python test_02_external_oauth_role_control.py"
 pat = "python test_03_pat_role_isolation.py"
 demo = "python test_04_interactive_demo.py"
 agent-test = "python test_04_interactive_demo.py --agent-test"
+session-policy = "python test_05_session_policy_secondary_roles.py"
+ownership = "python test_06_ownership_and_secondary_roles.py"
 
 [tool.pixi.dependencies]
 snowflake-connector-python = ">=4.4.0,<5"
