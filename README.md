@@ -95,6 +95,17 @@ This is expected behavior (secondary roles provide combined privileges from all 
 
 All four are tested and confirmed to prevent access via secondary role inheritance.
 
+### 8. Role Hierarchy and MCP Access
+
+Role hierarchy (inheritance) applies to MCP access as it does to any other Snowflake object. If ROLE_A inherits from ROLE_B (`GRANT ROLE ROLE_B TO ROLE ROLE_A`), then ROLE_A has all of ROLE_B's privileges — including OWNERSHIP or USAGE on MCP servers.
+
+This means a token scoped to `session:role:ROLE_A` with `X-Snowflake-Role: ROLE_A` gives access to MCP servers owned by ROLE_B, even with secondary roles disabled. This is standard RBAC behavior — ROLE_A's effective privileges include everything inherited from ROLE_B.
+
+To verify what a role inherits:
+```sql
+SHOW GRANTS TO ROLE <role_name>;  -- look for USAGE on other roles
+```
+
 ## What Does NOT Work
 
 | Approach | Why it fails |
@@ -193,3 +204,65 @@ Each script creates all required infrastructure (keys, integration, roles, table
 | `Accept: application/json` required | Without it: error 391902 "Unsupported Accept header null" |
 | `EXTERNAL_OAUTH_ANY_ROLE_MODE = ENABLE` | Required for `session:role-any` to work |
 | Auth errors are HTTP 200 + JSON-RPC error | Not HTTP 401/403 — inspect the response body |
+
+## FYI: Related Auth Behavior in Cortex Agents and OAuth
+
+The following features are not specific to MCP servers, but affect how authentication and authorization work for AI agents in Snowflake.
+
+### Agent Identity (`IS_AGENTIC` on OAuth Integrations)
+
+Snowflake OAuth custom integrations support an `IS_AGENTIC` parameter that marks all sessions through that integration as agent sessions:
+
+```sql
+CREATE SECURITY INTEGRATION my_agent_oauth
+  TYPE = OAUTH
+  OAUTH_CLIENT = CUSTOM
+  OAUTH_CLIENT_TYPE = 'CONFIDENTIAL'
+  OAUTH_REDIRECT_URI = 'https://my-agent.example.com/callback'
+  IS_AGENTIC = TRUE;
+```
+
+When `IS_AGENTIC = TRUE`:
+- `SYS_CONTEXT('SNOWFLAKE$CURRENT', 'IS_AGENT_ACTIVATED')` returns `TRUE` for those sessions
+- `QUERY_HISTORY.agent_type` = `EXTERNAL_AGENT` for all queries
+- `ACCESS_HISTORY.agents_info` is populated with agent details
+- Data protection policies (masking, row access, projection, etc.) can branch on `IS_AGENT_ACTIVATED` to restrict what agents see:
+
+```sql
+CREATE MASKING POLICY ssn_agent_mask AS (val STRING) RETURNS STRING ->
+  CASE
+    WHEN SYS_CONTEXT('SNOWFLAKE$CURRENT', 'IS_AGENT_ACTIVATED')::BOOLEAN
+      THEN '***-**-' || RIGHT(val, 4)
+    ELSE val
+  END;
+```
+
+This is a governance flag, not an auth-flow modifier — the underlying OAuth protocol is identical.
+
+### `SERVICE_AGENT` User Type
+
+For autonomous agents that act under their own identity (rather than on behalf of a human user):
+
+```sql
+CREATE USER my_agent_user
+  TYPE = SERVICE_AGENT
+  DEFAULT_ROLE = agent_role
+  DEFAULT_WAREHOUSE = agent_wh;
+```
+
+- Every session is automatically agent-active (`IS_AGENT_ACTIVATED = TRUE`)
+- Non-interactive only: supports workload identity federation, key-pair auth, and PATs
+- Unlike `SERVICE` users, does not require a network policy before PAT creation
+
+### Cortex Agent Authorization Model
+
+Cortex Agents use the **querying user's default role**, not the role active in their session. This is distinct from MCP server behavior (which respects `X-Snowflake-Role` and token scope).
+
+| Aspect | MCP Server | Cortex Agent |
+|--------|-----------|-------------|
+| Role resolution | `X-Snowflake-Role` header > token scope > DEFAULT_ROLE | Always DEFAULT_ROLE |
+| Secondary roles | Controlled by token scope and session policy | Controlled by DEFAULT_SECONDARY_ROLES |
+| Per-request role switching | Yes (via header) | No |
+| Session role matters | Yes | No (ignored in favor of default role) |
+
+For Cortex Agents, the default role must have USAGE on the agent, its database/schema, warehouse, and all tool targets (search services, semantic views, functions).
